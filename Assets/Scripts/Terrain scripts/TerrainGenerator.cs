@@ -10,7 +10,6 @@ namespace TerrainGenerator2D
         public int mapWidth = 80;
         public int seed = 42;
         public int numRivers = 8;
-        public int numTowns = 12;
 
         [Header("Auto Generate")]
         public bool autoGenerateOnStart = true;
@@ -19,6 +18,20 @@ namespace TerrainGenerator2D
         public TileBase baseTile;
         public Tilemap targetTilemap;
 
+        [Header("Resource-Rich Town Placement")]
+        public int numTowns = 12;              // Fewer than before—more "special"
+        public float minTownDistance = 8f;    // Prevents clumping
+        public float townFoundingBoost = 5f;  // Guaranteed starting resources for new towns
+
+
+        [Header("Attributes & Resources")]
+        public bool generateResources = true;
+        public int resourceDensity = 15;           // higher = more resource nodes
+        public float resourceAmountMin = 2f;
+        public float resourceAmountMax = 10f;
+
+        private char[,] terrain;                   // make this a field, not local
+        private TerrainData[,] mapData;            // the data grid
         private Tilemap tilemap;
 
         void Start()
@@ -76,7 +89,7 @@ namespace TerrainGenerator2D
                         hm[y, x] = (hm[y, x] - minH) / range;
 
             // Classify terrain
-            char[,] terrain = new char[mapHeight, mapWidth];
+            terrain = new char[mapHeight, mapWidth];
             for (int y = 0; y < mapHeight; y++)
                 for (int x = 0; x < mapWidth; x++)
                 {
@@ -148,28 +161,7 @@ namespace TerrainGenerator2D
             }
 
             // Place towns on suitable land (plains/light forest)
-            List<Vector2Int> suitable = new List<Vector2Int>();
-            for (int y = 0; y < mapHeight; y++)
-                for (int x = 0; x < mapWidth; x++)
-                {
-                    float h = hm[y, x];
-                    if (h >= 0.22f && h < 0.65f)
-                        suitable.Add(new Vector2Int(x, y));
-                }
-            // Fisher-Yates shuffle (seeded)
-            for (int i = suitable.Count - 1; i > 0; i--)
-            {
-                int j = Random.Range(0, i + 1);
-                Vector2Int temp = suitable[i];
-                suitable[i] = suitable[j];
-                suitable[j] = temp;
-            }
-            int townsToPlace = Mathf.Min(numTowns, suitable.Count);
-            for (int i = 0; i < townsToPlace; i++)
-            {
-                Vector2Int p = suitable[i];
-                terrain[p.y, p.x] = '@';
-            }
+            PlaceTowns();
 
             // Build/populate tilemap
             SetupTilemap();
@@ -220,6 +212,179 @@ namespace TerrainGenerator2D
             Debug.Log(mapLog + "\nLegend:\n~ deep water\n. shallow\n, plains\nT forest\n^ hills\nM mountains\n= river\n@ town");
         }
 
+        private void PlaceTowns()
+        {
+            // === BUILD DATA LAYER (Resources) ===
+            mapData = new TerrainData[mapHeight, mapWidth];
+            for (int y = 0; y < mapHeight; y++)
+                for (int x = 0; x < mapWidth; x++)
+                {
+                    char t = terrain[y, x];
+                    float weight = GetTravelWeight(t);
+                    ResourceType res = ResourceType.None;
+                    float amt = 0f;
+
+                    if (generateResources && Random.value * 100f < resourceDensity)
+                    {
+                        res = GetRandomResource(t);
+                        if (res != ResourceType.None)
+                            amt = Random.Range(resourceAmountMin, resourceAmountMax);
+                    }
+
+                    mapData[y, x] = new TerrainData(t, weight, res, amt);
+                }
+
+            PlaceResourceBasedTowns();
+
+
+        }
+
+        private void PlaceResourceBasedTowns()
+        {
+            // 1. Find ALL buildable tiles (good terrain + water access)
+            List<TownCandidate> candidates = new List<TownCandidate>();
+            for (int y = 0; y < mapHeight; y++)
+                for (int x = 0; x < mapWidth; x++)
+                {
+                    if (IsSuitableForTown(x, y))
+                    {
+                        float score = CalculateTownScore(x, y);
+                        candidates.Add(new TownCandidate(new Vector2Int(x, y), score));
+                    }
+                }
+
+            // 2. Sort by score (richest first)
+            candidates.Sort((a, b) => b.score.CompareTo(a.score));
+
+            // 3. Pick top N, with spacing
+            int placed = 0;
+            List<Vector2Int> townPositions = new List<Vector2Int>();
+            foreach (var cand in candidates)
+            {
+                if (placed >= numTowns) break;
+
+                // Check distance to existing towns
+                bool tooClose = false;
+                foreach (var existing in townPositions)
+                {
+                    if (Vector2Int.Distance(cand.pos, existing) < minTownDistance)
+                    {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose) continue;
+
+                // Place town!
+                terrain[cand.pos.y, cand.pos.x] = '@';
+                mapData[cand.pos.y, cand.pos.x].isTown = true;
+
+                // Give founding boost (so they don't die immediately)
+                BoostTownResources(cand.pos);
+
+                townPositions.Add(cand.pos);
+                placed++;
+            }
+
+            Debug.Log($"Placed {placed} resource-rich towns (out of {numTowns} target)");
+        }
+
+        // Helper struct
+        private struct TownCandidate
+        {
+            public Vector2Int pos;
+            public float score;
+            public TownCandidate(Vector2Int p, float s) { pos = p; score = s; }
+        }
+
+        private bool IsSuitableForTown(int x, int y)
+        {
+            char t = terrain[y, x];
+            if (t == '~' || t == 'M' || t == '.') return false; // No deep water, no pure mountains, no beach-only
+
+            // Must have water access (river or adjacent shallow)
+            return HasWaterAccess(x, y);
+        }
+
+        private bool HasWaterAccess(int x, int y)
+        {
+            // Check self + 8 neighbors for river/shallow
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    int nx = x + dx, ny = y + dy;
+                    if (nx >= 0 && nx < mapWidth && ny >= 0 && ny < mapHeight)
+                    {
+                        char nt = terrain[ny, nx];
+                        if (nt == '=' || nt == '.') return true; // River or coast
+                    }
+                }
+            return false;
+        }
+
+        private float CalculateTownScore(int x, int y)
+        {
+            float score = 0f;
+
+            // Terrain bonus
+            char t = terrain[y, x];
+            switch (t)
+            {
+                case ',': score += 25f; break;  // Plains = prime farmland
+                case 'T': score += 18f; break;  // Forest = lumber
+                case '^': score += 12f; break;  // Hills = defensible + stone
+                default: score += 5f; break;
+            }
+
+            // Resource bonus (self + 3x3 neighborhood)
+            for (int dy = -3; dy <= 3; dy++)
+            {
+                for (int dx = -3; dx <= 3; dx++)
+                {
+                    int nx = x + dx, ny = y + dy;
+                    if (nx >= 0 && nx < mapWidth && ny >= 0 && ny < mapHeight)
+                    {
+                        var data = mapData[ny, nx];
+                        if (data.resource != ResourceType.None)
+                        {
+                            float distFactor = 1f / (1f + Mathf.Abs(dx) + Mathf.Abs(dy)); // Closer = better
+                            score += (data.resourceAmount * 3f) * distFactor;
+
+                            // Extra love for food/fish (sustainability)
+                            if (data.resource == ResourceType.Food || data.resource == ResourceType.Fish)
+                                score += 30f * distFactor;
+                        }
+                    }
+                }
+            }
+
+            return score;
+        }
+
+        private void BoostTownResources(Vector2Int pos)
+        {
+            // Give every new town a starter kit (food + one local resource)
+            var data = mapData[pos.y, pos.x];
+            data.resourceAmount += townFoundingBoost; // Local boost
+            data.resource = ResourceType.Food;        // Guaranteed food
+
+            // Also seed 2-3 nearby tiles with resources
+            for (int i = 0; i < 3; i++)
+            {
+                int rx = pos.x + Random.Range(-4, 5);
+                int ry = pos.y + Random.Range(-4, 5);
+                if (rx >= 0 && rx < mapWidth && ry >= 0 && ry < mapHeight)
+                {
+                    var nearby = mapData[ry, rx];
+                    if (nearby.resource == ResourceType.None)
+                    {
+                        nearby.resource = GetRandomResource(terrain[ry, rx]);
+                        nearby.resourceAmount = Random.Range(4f, 8f);
+                    }
+                }
+            }
+        }
+
         private void SetupTilemap()
         {
             if (targetTilemap != null)
@@ -245,6 +410,42 @@ namespace TerrainGenerator2D
             tmGO.transform.SetParent(gridGO.transform);
             tilemap = tmGO.AddComponent<Tilemap>();
             tmGO.AddComponent<TilemapRenderer>();
+        }
+
+        private float GetTravelWeight(char t)
+        {
+            switch (t)
+            {
+                case '~': return Mathf.Infinity;
+                case '.': return 1.5f;
+                case ',': return 1.0f;
+                case 'T': return 1.8f;
+                case '^': return 2.5f;
+                case 'M': return 4.0f;
+                case '=': return 0.6f;
+                case '@': return 1.0f;
+                default: return 1.0f;
+            }
+        }
+
+        private ResourceType GetRandomResource(char t)
+        {
+            float roll = Random.value;
+            switch (t)
+            {
+                case 'M':
+                case '^':
+                    return roll < 0.6f ? ResourceType.Iron : ResourceType.Stone;
+                case 'T':
+                    return ResourceType.Wood;
+                case ',':
+                    return roll < 0.7f ? ResourceType.Food : ResourceType.Gold;
+                case '=':
+                case '.':
+                    return ResourceType.Fish;
+                default:
+                    return ResourceType.None;
+            }
         }
     }
 }
